@@ -2,4 +2,4 @@
 
 
 
-Back ups fro my Jupyter Docker Stacks
+Back ups from my Jupyter Docker Stacks
