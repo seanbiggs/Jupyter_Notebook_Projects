@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+
+import argparse
+from datetime import datetime
+import logging
+import sys
+
+
+current_season, current_week = 2020, 1
+
+now = datetime.now()
+
+parser = argparse.ArgumentParser(
+    description="\n".join([
+        "NFL ratings and predictions. Points spreads use Vegas sign convention.",
+    ]), formatter_class=argparse.RawTextHelpFormatter
+)
+
+subparsers = parser.add_subparsers(
+    dest="subparser",
+    help="base functionality",
+    required=True,
+)
+
+games_p = subparsers.add_parser("games")
+calibrate_p = subparsers.add_parser("calibrate")
+predict_p = subparsers.add_parser("predict")
+forecast_p = subparsers.add_parser("forecast")
+rank_p = subparsers.add_parser("rank")
+validate_p = subparsers.add_parser("validate")
+
+games_p.add_argument(
+    "--head",
+    type=int,
+    default=-1,
+    help="Print the first HEAD database games to standard output.",
+)
+
+games_p.add_argument(
+    "--tail",
+    type=int,
+    default=-1,
+    help="Print the last TAIL database games to standard output.",
+)
+
+calibrate_p.add_argument(
+    "--steps",
+    default=100,
+    type=int,
+    help="number of calibration steps",
+)
+
+predict_p.add_argument(
+    "datetime",
+    type=str,
+    help="datetime compatible string, e.g. 2020-01-01T01:00:00",
+)
+
+predict_p.add_argument(
+    "away-team",
+    type=str,
+    help="away team",
+)
+
+predict_p.add_argument(
+    "home-team",
+    type=str,
+    help="home team",
+)
+
+predict_p.add_argument(
+    "--spread",
+    type=float,
+    nargs=3,
+    metavar="float",
+    help="away vig, home vig, home point spread",
+)
+
+predict_p.add_argument(
+    "--total",
+    type=float,
+    nargs=3,
+    metavar="float",
+    help="over vig, under vig, point total",
+)
+
+forecast_p.add_argument(
+    "season",
+    type=int,
+    nargs='?',
+    help="season year; default is current season",
+    default=current_season,
+)
+
+forecast_p.add_argument(
+    "week",
+    type=int,
+    nargs='?',
+    help="season week; default is current week",
+    default=current_week,
+)
+
+rank_p.add_argument(
+    "--datetime",
+    type=str,
+    help="datetime compatible string, e.g. 2020-01-01T01:00:00",
+    default=str(now),
+)
+
+args = parser.parse_args()
+kwargs = vars(args)
+subparser = kwargs.pop("subparser")
+
+
+if subparser == "games":
+    """
+    Prints a subset of the games database to standard out.
+    Arguments --head and --tail can be used to increase the maximum number of
+    rows printed.
+
+    """
+    from armchair_analysis.game_data import game_data
+    import pandas as pd
+
+    nhead = kwargs["head"]
+    ntail = kwargs["tail"]
+    games = game_data.dataframe
+
+    if nhead == -1 and ntail == -1:
+        print(games)
+    elif nhead > 0 and ntail == -1:
+        pd.set_option("display.max_rows", nhead)
+        print(games.head(nhead))
+    elif nhead == -1 and ntail > 0:
+        pd.set_option("display.max_rows", ntail)
+        print(games.tail(ntail))
+    else:
+        sys.exit(
+            f"error: invalid argument combination --head {nhead} --tail {ntail}")
+
+elif subparser == "calibrate":
+    """
+    Calibrates the model hyperparameters on the game data stored in the database.
+    Argument --steps STEPS can be used to manually specify the number of
+    training iterations (default is 100 steps).
+
+    """
+    from nflmodel import model
+
+    steps = kwargs["steps"]
+    for mode in ["spread", "total"]:
+        model.MeloNFL.from_cache(mode, steps=steps, calibrate=True)
+
+elif subparser == "predict":
+    """
+    Predict the outcome of a specific NFL game matchup.
+    Need not be an actual game on the schedule.
+
+    """
+    from nflmodel import model
+    import pandas as pd
+
+    datetime = kwargs["datetime"]
+    away = kwargs["away-team"]
+    home = kwargs["home-team"]
+    spread_args = kwargs["spread"]
+    total_args = kwargs["total"]
+
+    logging.info("{} {} at {}\n".format(datetime, away, home))
+
+    spreads = model.MeloNFL.from_cache("spread")
+    totals = model.MeloNFL.from_cache("total")
+
+    win_prob_away = spreads.probability(datetime, away, home)
+    win_prob_home = 1 - win_prob_away
+
+    spread_home = spreads.median(datetime, away, home)
+    spread_away = -spread_home
+
+    total = totals.median(datetime, away, home)
+
+    away_score, home_score = (
+        0.5*(total - spread_away), 0.5*(total + spread_away)
+    )
+
+    report = pd.DataFrame({
+        "away": [
+            away,
+            "{:.0f}%".format(100*win_prob_away),
+            "{:.1f}".format(spread_away),
+            "{:.1f}".format(total),
+            "{:.0f}".format(round(away_score)),
+        ],
+        "home": [
+            home,
+            "{:.0f}%".format(100*win_prob_home),
+            "{:.1f}".format(spread_home),
+            "{:.1f}".format(total),
+            "{:.0f}".format(round(home_score)),
+        ],
+    })
+
+    row_labels = {0: "team", 1: "win prob", 2: "spread", 3: "total", 4: "score"}
+    report.rename(index=row_labels, inplace=True)
+
+    if spread_args is not None:
+        """
+        if specified, report point spread statistics
+
+        """
+        away_vig, home_vig, home_spread = spread_args
+        away_cover_prob = spreads.probability(datetime, away, home, lines=home_spread)
+        home_cover_prob = 1 - away_cover_prob
+
+        away_return = away_cover_prob*100 + (1 - away_cover_prob)*away_vig
+        away_return_rate = away_return / 100.
+
+        home_return = home_cover_prob*100 + (1 - home_cover_prob)*home_vig
+        home_return_rate = home_return / 100.
+
+        away_report = [
+            "{:.0f}%".format(100*away_cover_prob),
+            "{:.0f}%".format(100*away_return_rate),
+        ]
+
+        home_report = [
+            "{:.0f}%".format(100*home_cover_prob),
+            "{:.0f}%".format(100*home_return_rate),
+        ]
+
+        spread_report = pd.DataFrame({
+            "away": away_report,
+            "home": home_report,
+        })
+
+        row_labels = {0: "spread cover", 1: "spread return"}
+        spread_report.rename(index=row_labels, inplace=True)
+
+        report = pd.concat((report, spread_report))
+
+    if total_args is not None:
+        """
+        if specified, report point total statistics
+
+        """
+        over_vig, under_vig, total = total_args
+        over_cover_prob = totals.probability(datetime, away, home, lines=total)
+        under_cover_prob = 1 - over_cover_prob
+
+        over_return = over_cover_prob*100 + (1 - over_cover_prob)*over_vig
+        over_return_rate = over_return / 100.
+
+        under_return = under_cover_prob*100 + (1 - under_cover_prob)*under_vig
+        under_return_rate = under_return / 100.
+
+        over_bet = [
+            "",
+            "over",
+            "{:.0f}%".format(100*over_cover_prob),
+            "{:.0f}%".format(100*over_return_rate),
+        ]
+
+        under_bet = [
+            "",
+            "under",
+            "{:.0f}%".format(100*under_cover_prob),
+            "{:.0f}%".format(100*under_return_rate),
+        ]
+
+        total_report = pd.DataFrame({
+            "away": over_bet,
+            "home": under_bet,
+        })
+
+        row_labels = {0: "", 1: "", 2: "total cover", 3: "total return"}
+        total_report.rename(index=row_labels, inplace=True)
+
+        report = pd.concat((report, total_report))
+
+    print(report, "\n")
+
+    print("*actual return rate lower than predicted")
+
+elif subparser == "rank":
+    """
+    Rank NFL teams at a certain point in time. The rankings are based on all
+    available data preceding that moment in time.
+
+    """
+    from nflmodel import model
+    import pandas as pd
+
+    datetime = kwargs["datetime"]
+    logging.info("Rankings as of {}\n".format(datetime))
+
+    spreads = model.MeloNFL.from_cache("spread")
+    totals = model.MeloNFL.from_cache("total")
+
+    df = pd.DataFrame(
+        spreads.rank(datetime, statistic="win"),
+        columns=["team", "win prob"],
+    )
+
+    df["win prob"] = df[["win prob"]].applymap("{:.2f}".format)
+    col1 = df["team"] + "  " + df["win prob"]
+
+    df = pd.DataFrame(
+        spreads.rank(datetime, statistic="mean"),
+        columns=["team", "point spread"],
+    ).round(decimals=1)
+
+    df["point spread"] *= -1
+
+    df["point spread"] = df[["point spread"]].applymap("{:4.1f}".format)
+    col2 = df["team"] + "  " + df["point spread"]
+
+    df = pd.DataFrame(
+        totals.rank(datetime),
+        columns=["team", "point total"],
+    ).round(decimals=1)
+
+    df["point total"] = df[["point total"]].applymap("{:4.1f}".format)
+    col3 = df["team"] + "  " + df["point total"]
+
+    rankings = pd.concat([col1, col2, col3], axis=1)
+    rankings.insert(1, "sep1", '│')
+    rankings.insert(3, "sep2", '│')
+    rankings.columns = ["win prob", '', "spread", '', "total"]
+    rankings.index += 1
+
+    rankings.index.name = "rank"
+
+    print(rankings.to_string(header=True), "\n")
+
+    print("\n".join(["*expected performance against league average",
+                     "opponent on a neutral field"]))
+
+elif subparser == "validate":
+    """
+    Validate the nflmodel repdictions by plotting the distribution of quantiles
+    and standardized residuals.
+
+    """
+    from nflmodel import validate
+
+    validate.assess_predictions("spread")
+    validate.assess_predictions("total")
+
+else:
+    raise ValueError("No such argument {}".format(subparser))
